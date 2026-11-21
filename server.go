@@ -192,12 +192,13 @@ func (s *Server) readListener(l net.Listener, am *allocation.Manager) {
 
 			s.readLoop(NewSTUNConn(conn), am, tlsConnectionState)
 
-			// Delete allocation
-			am.DeleteAllocation(&allocation.FiveTuple{
+			// Delete the allocation only if this control connection still owns
+			// it, so a stale teardown cannot remove a newer generation.
+			am.DeleteAllocationForConn(&allocation.FiveTuple{
 				Protocol: allocation.UDP, // fixed UDP
 				SrcAddr:  conn.RemoteAddr(),
 				DstAddr:  conn.LocalAddr(),
-			})
+			}, conn)
 
 			if err := conn.Close(); err != nil && !errors.Is(err, net.ErrClosed) {
 				s.log.Errorf("Failed to close conn: %s", err)

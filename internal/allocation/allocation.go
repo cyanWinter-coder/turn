@@ -42,10 +42,15 @@ type Allocation struct {
 	channelBindings     []*ChannelBind
 	lifetimeTimer       *time.Timer
 	closed              chan any
+	closeOnce           sync.Once
+	closeErr            error
 	userID, realm       string
 	eventHandler        EventHandler
 	log                 logging.LeveledLogger
 	addressFamily       proto.RequestedAddressFamily // RFC 6156
+
+	// generation is the admission generation that produced this allocation.
+	generation uint64
 
 	// Relay Transport for UDP
 	relayPacketConn net.PacketConn
@@ -88,11 +93,25 @@ func (a *Allocation) GetPermission(addr net.Addr) *Permission {
 	return a.permissions[ipnet.FingerprintAddr(addr)]
 }
 
-// AddPermission adds a new permission to the allocation.
+// AddPermission adds a new permission to the allocation. It is ignored once
+// teardown has started, so a late CreatePermission cannot revive an allocation
+// whose permission and relay resources were already reclaimed.
 func (a *Allocation) AddPermission(perms *Permission) {
+	if perms == nil {
+		return
+	}
+
 	fingerprint := ipnet.FingerprintAddr(perms.Addr)
 
 	a.permissionsLock.Lock()
+	// Re-check under the lock: Close records teardown before taking it, so a
+	// permission added after that point would otherwise outlive the allocation.
+	if a.IsClosed() {
+		a.permissionsLock.Unlock()
+
+		return
+	}
+
 	existedPermission, ok := a.permissions[fingerprint]
 	if ok {
 		existedPermission.refresh(perms.timeout)
@@ -117,9 +136,18 @@ func (a *Allocation) AddPermission(perms *Permission) {
 
 // RemovePermission removes the net.Addr's fingerprint from the allocation's permissions.
 func (a *Allocation) RemovePermission(addr net.Addr) {
+	fingerprint := ipnet.FingerprintAddr(addr)
+
 	a.permissionsLock.Lock()
-	defer a.permissionsLock.Unlock()
-	delete(a.permissions, ipnet.FingerprintAddr(addr))
+	_, existed := a.permissions[fingerprint]
+	delete(a.permissions, fingerprint)
+	a.permissionsLock.Unlock()
+
+	// A permission lifetime timer may fire while the allocation is being torn
+	// down, so report each deletion at most once.
+	if !existed {
+		return
+	}
 
 	if a.eventHandler.OnPermissionDeleted != nil {
 		if u, ok := addr.(*net.UDPAddr); ok {
@@ -143,8 +171,13 @@ func (a *Allocation) ListPermissions() []*Permission {
 }
 
 // AddChannelBind adds a new ChannelBind to the allocation, it also updates the
-// permissions needed for this ChannelBind.
+// permissions needed for this ChannelBind. It is ignored once teardown has
+// started, so a late ChannelBind cannot revive a reclaimed allocation.
 func (a *Allocation) AddChannelBind(chanBind *ChannelBind, channelLifetime, permissionLifetime time.Duration) error {
+	if chanBind == nil || a.IsClosed() {
+		return errAllocationClosed
+	}
+
 	// Check that this channel id isn't bound to another transport address, and
 	// that this transport address isn't bound to another channel number.
 	channelByNumber := a.GetChannelByNumber(chanBind.Number)
@@ -163,6 +196,11 @@ func (a *Allocation) AddChannelBind(chanBind *ChannelBind, channelLifetime, perm
 	// Add or refresh this channel.
 	if channelByNumber == nil {
 		a.channelBindingsLock.Lock()
+		if a.IsClosed() {
+			a.channelBindingsLock.Unlock()
+
+			return errAllocationClosed
+		}
 		defer a.channelBindingsLock.Unlock()
 
 		chanBind.allocation = a
@@ -192,18 +230,20 @@ func (a *Allocation) RemoveChannelBind(number proto.ChannelNumber) bool {
 	a.channelBindingsLock.Lock()
 	defer a.channelBindingsLock.Unlock()
 
-	for i := len(a.channelBindings) - 1; i >= 0; i-- {
-		if a.channelBindings[i].Number == number {
-			if a.eventHandler.OnChannelDeleted != nil {
-				a.eventHandler.OnChannelDeleted(a.fiveTuple.SrcAddr, a.fiveTuple.DstAddr,
-					a.fiveTuple.Protocol.String(), a.userID, a.realm,
-					a.RelayAddr, a.channelBindings[i].Peer, uint16(a.channelBindings[i].Number))
-			}
-
-			a.channelBindings = append(a.channelBindings[:i], a.channelBindings[i+1:]...)
-
-			return true
+	for i, cb := range a.channelBindings {
+		if cb.Number != number {
+			continue
 		}
+
+		if a.eventHandler.OnChannelDeleted != nil {
+			a.eventHandler.OnChannelDeleted(a.fiveTuple.SrcAddr, a.fiveTuple.DstAddr,
+				a.fiveTuple.Protocol.String(), a.userID, a.realm,
+				a.RelayAddr, cb.Peer, uint16(cb.Number))
+		}
+
+		a.channelBindings = append(a.channelBindings[:i], a.channelBindings[i+1:]...)
+
+		return true
 	}
 
 	return false
@@ -245,16 +285,31 @@ func (a *Allocation) ListChannelBindings() []*ChannelBind {
 	return cs
 }
 
-// Refresh updates the allocations lifetime.
-func (a *Allocation) Refresh(lifetime time.Duration) {
+// Refresh updates the allocations lifetime. It returns false and leaves the
+// allocation untouched if teardown has already started, so a late Refresh can
+// never revive a reclaimed allocation.
+func (a *Allocation) Refresh(lifetime time.Duration) bool {
+	if a.IsClosed() {
+		return false
+	}
+
 	if !a.lifetimeTimer.Reset(lifetime) {
 		a.log.Errorf("Failed to reset allocation timer for %v", a.fiveTuple)
+
+		return false
 	}
+
+	return true
 }
 
 // AddressFamily returns the address family of the allocation (RFC 6156).
 func (a *Allocation) AddressFamily() proto.RequestedAddressFamily {
 	return a.addressFamily
+}
+
+// Generation returns the admission generation that created the allocation.
+func (a *Allocation) Generation() uint64 {
+	return a.generation
 }
 
 // SetResponseCache cache allocation response for retransmit allocation request.
@@ -302,44 +357,65 @@ func (a *Allocation) RemoveTCPConnection(m *Manager, connectionID proto.Connecti
 	a.removeTCPConnection(connectionID)
 }
 
-// Close closes the allocation.
+// Close closes the allocation. It is idempotent and always performs the same
+// teardown order (lifetime timer, TCP connections, permissions, channel
+// bindings, relay socket) so a concurrent refresh timeout, relay read-loop error
+// and explicit Refresh with LIFETIME 0 observe one consistent transition. The
+// manager reports the allocation as deleted exactly once, after Close returns.
 func (a *Allocation) Close() error {
+	a.closeOnce.Do(func() {
+		close(a.closed)
+
+		if a.lifetimeTimer != nil {
+			a.lifetimeTimer.Stop()
+		}
+
+		for tcpConnection := range a.tcpConnections {
+			a.removeTCPConnection(tcpConnection)
+		}
+
+		for _, p := range a.ListPermissions() {
+			a.RemovePermission(p.Addr)
+			if p.lifetimeTimer != nil {
+				p.lifetimeTimer.Stop()
+			}
+		}
+
+		for _, c := range a.ListChannelBindings() {
+			a.RemoveChannelBind(c.Number)
+			if c.lifetimeTimer != nil {
+				c.lifetimeTimer.Stop()
+			}
+		}
+
+		switch {
+		case a.relayPacketConn != nil:
+			a.closeErr = a.relayPacketConn.Close()
+		case a.relayListener != nil:
+			a.closeErr = a.relayListener.Close()
+		}
+	})
+
+	return a.closeErr
+}
+
+// IsClosed reports whether the allocation has begun teardown. Callers use it to
+// drop work for an allocation that has been reclaimed, so late data or a late
+// permission timer cannot revive it.
+func (a *Allocation) IsClosed() bool {
 	select {
 	case <-a.closed:
-		return nil
+		return true
 	default:
+		return false
 	}
-	close(a.closed)
-
-	a.lifetimeTimer.Stop()
-
-	for tcpConnection := range a.tcpConnections {
-		a.removeTCPConnection(tcpConnection)
-	}
-
-	for _, p := range a.ListPermissions() {
-		a.RemovePermission(p.Addr)
-		p.lifetimeTimer.Stop()
-	}
-
-	for _, c := range a.ListChannelBindings() {
-		a.RemoveChannelBind(c.Number)
-		c.lifetimeTimer.Stop()
-	}
-
-	if a.relayPacketConn != nil {
-		return a.relayPacketConn.Close()
-	}
-
-	if a.relayListener != nil {
-		return a.relayListener.Close()
-	}
-
-	return nil
 }
 
 // WriteTo writes a packet with payload p to addr via the Relay socket.
 func (a *Allocation) WriteTo(p []byte, addr net.Addr) (n int, err error) {
+	if a.IsClosed() {
+		return 0, errAllocationClosed
+	}
 	if a.relayPacketConn == nil {
 		return 0, errNilRelaySocket
 	}
@@ -375,8 +451,14 @@ func (a *Allocation) packetConnHandler(manager *Manager) {
 	for {
 		n, srcAddr, err := a.relayPacketConn.ReadFrom(buffer)
 		if err != nil {
-			manager.DeleteAllocation(a.fiveTuple)
+			manager.DeleteAllocationIf(a)
 
+			return
+		}
+
+		// The relay loop can win a race against teardown. Once Close has started
+		// the allocation must not relay or otherwise look alive again.
+		if a.IsClosed() {
 			return
 		}
 
@@ -433,7 +515,13 @@ func (a *Allocation) connHandler(manager *Manager) {
 	for {
 		conn, err := a.relayListener.Accept()
 		if err != nil {
-			manager.DeleteAllocation(a.fiveTuple)
+			manager.DeleteAllocationIf(a)
+
+			return
+		}
+
+		if a.IsClosed() {
+			_ = conn.Close()
 
 			return
 		}

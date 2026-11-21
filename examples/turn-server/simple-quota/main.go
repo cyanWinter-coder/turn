@@ -71,35 +71,34 @@ func main() { // nolint:cyclop
 		},
 
 		// QuotaHandler allows rejecting allocations when a user exceeds a quota.
-		// This example limits concurrent allocations per user.
+		// This example limits concurrent allocations per user. The slot is
+		// reserved here, under the same lock as the check, so that concurrent
+		// Allocate requests cannot exceed the limit.
 		QuotaHandler: func(userID, _ string, srcAddr net.Addr) (ok bool) {
 			userSessionLock.Lock()
 			defer userSessionLock.Unlock()
 			if userSessions[userID] < maxAllocationsPerUser {
+				userSessions[userID]++
+
 				return true
 			}
 
-			log.Printf("Allocation quota reached for user-id %q from %s", userID, srcAddr.String())
+			log.Printf("Allocation quota reached for user-id %q from %s (retry after %s)",
+				userID, srcAddr.String(), turn.DefaultQuotaRetryAfter)
 
 			return false
 		},
 
-		// Track allocations as they are Created+Deleted. This ensures that users
-		// don't have more then maxAllocationsPerUser at a time
+		// Release the slot reserved by QuotaHandler when the allocation is
+		// deleted, or when the accepted Allocate request fails before an
+		// allocation is published. Exactly one of these fires per accepted
+		// request.
 		EventHandler: turn.EventHandler{
-			OnAllocationCreated: func(_, _ net.Addr, _, userID, _ string, _ net.Addr, _ int) {
-				userSessionLock.Lock()
-				defer userSessionLock.Unlock()
-
-				userSessions[userID]++
-			},
 			OnAllocationDeleted: func(_, _ net.Addr, _, userID, _ string) {
-				userSessionLock.Lock()
-				defer userSessionLock.Unlock()
-
-				if userSessions[userID] > 0 {
-					userSessions[userID]--
-				}
+				releaseUserSession(userSessionLock, userSessions, userID)
+			},
+			OnAllocationFailed: func(_, _ net.Addr, _, userID, _ string, _ error) {
+				releaseUserSession(userSessionLock, userSessions, userID)
 			},
 		},
 
@@ -127,5 +126,14 @@ func main() { // nolint:cyclop
 
 	if err = server.Close(); err != nil {
 		log.Panic(err)
+	}
+}
+
+func releaseUserSession(lock *sync.Mutex, sessions map[string]int, userID string) {
+	lock.Lock()
+	defer lock.Unlock()
+
+	if sessions[userID] > 0 {
+		sessions[userID]--
 	}
 }

@@ -16,6 +16,7 @@ import (
 	"fmt"
 	"math/big"
 	"net"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -1481,7 +1482,9 @@ func TestQuotaReached(t *testing.T) {
 
 	_, err = client2.Allocate()
 	assert.Error(t, err)
-	assert.Equal(t, err.Error(), "Allocate error response (error 486: )")
+	// RFC 8656 Section 6.6: 486 (Allocation Quota Reached). The reason phrase
+	// names the cause and the minimum retry window instead of being empty.
+	assert.Equal(t, err.Error(), "Allocate error response (error 486: Allocation Quota Reached; retry after 60s)")
 }
 
 func TestReservation(t *testing.T) {
@@ -2184,4 +2187,116 @@ func BenchmarkServer(b *testing.B) {
 			RunBenchmarkServer(b, i)
 		})
 	}
+}
+
+var errRelayAllocationFailed = errors.New("relay allocation failed")
+
+type failOnceRelayAddressGenerator struct {
+	*RelayAddressGeneratorStatic
+	failed atomic.Bool
+}
+
+func (g *failOnceRelayAddressGenerator) AllocatePacketConn(
+	conf AllocateListenerConfig,
+) (net.PacketConn, net.Addr, error) {
+	if g.failed.CompareAndSwap(false, true) {
+		return nil, nil, errRelayAllocationFailed
+	}
+
+	return g.RelayAddressGeneratorStatic.AllocatePacketConn(conf)
+}
+
+func TestQuotaConcurrentTCPAllocations(t *testing.T) {
+	const maxAllocations, clients = 1, 16
+
+	listener, err := net.Listen("tcp4", "127.0.0.1:0") // nolint: noctx
+	require.NoError(t, err)
+
+	var quotaLock sync.Mutex
+	allocations := 0
+	release := func() {
+		quotaLock.Lock()
+		defer quotaLock.Unlock()
+		allocations--
+	}
+
+	server, err := NewServer(ServerConfig{
+		AuthHandler: func(ra *RequestAttributes) (userID string, key []byte, ok bool) {
+			return ra.Username, GenerateAuthKey(ra.Username, "pion.ly", "pass"), true
+		},
+		QuotaHandler: func(string, string, net.Addr) bool {
+			quotaLock.Lock()
+			defer quotaLock.Unlock()
+			if allocations >= maxAllocations {
+				return false
+			}
+			allocations++
+
+			return true
+		},
+		EventHandler: EventHandler{
+			OnAllocationDeleted: func(net.Addr, net.Addr, string, string, string) { release() },
+			OnAllocationFailed:  func(net.Addr, net.Addr, string, string, string, error) { release() },
+		},
+		Realm: "pion.ly",
+		ListenerConfigs: []ListenerConfig{{
+			Listener: listener,
+			RelayAddressGenerator: &failOnceRelayAddressGenerator{
+				RelayAddressGeneratorStatic: &RelayAddressGeneratorStatic{
+					RelayAddress: net.ParseIP("127.0.0.1"),
+					Address:      "127.0.0.1",
+				},
+			},
+		}},
+		LoggerFactory: logging.NewDefaultLoggerFactory(),
+	})
+	require.NoError(t, err)
+	defer server.Close() //nolint:errcheck
+
+	serverAddr := listener.Addr().String()
+	turnClients := make([]*Client, 0, clients)
+	for range clients {
+		conn, dialErr := net.Dial("tcp4", serverAddr) // nolint: noctx
+		require.NoError(t, dialErr)
+
+		client, clientErr := NewClient(&ClientConfig{
+			Conn:           NewSTUNConn(conn),
+			STUNServerAddr: serverAddr,
+			TURNServerAddr: serverAddr,
+			Username:       testUser,
+			Password:       "pass",
+			Realm:          "pion.ly",
+			LoggerFactory:  logging.NewDefaultLoggerFactory(),
+		})
+		require.NoError(t, clientErr)
+		require.NoError(t, client.Listen())
+		defer client.Close()
+		turnClients = append(turnClients, client)
+	}
+
+	_, err = turnClients[0].Allocate()
+	require.ErrorContains(t, err, "error 508")
+
+	relayConns := make([]net.PacketConn, clients)
+	var wg sync.WaitGroup
+	for i, client := range turnClients {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			if relayConn, allocErr := client.Allocate(); allocErr == nil {
+				relayConns[i] = relayConn
+			}
+		}()
+	}
+	wg.Wait()
+
+	admitted := 0
+	for _, relayConn := range relayConns {
+		if relayConn != nil {
+			admitted++
+			defer relayConn.Close() //nolint:errcheck
+		}
+	}
+	assert.Equal(t, maxAllocations, admitted)
+	assert.Equal(t, maxAllocations, server.AllocationCount())
 }

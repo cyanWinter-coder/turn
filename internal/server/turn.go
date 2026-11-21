@@ -10,6 +10,7 @@ import (
 	"io"
 	"net"
 	"strconv"
+	"time"
 
 	"github.com/pion/randutil"
 	"github.com/pion/stun/v4"
@@ -75,6 +76,19 @@ func handleAllocateRequest(req Request, stunMsg *stun.Message) error { //nolint:
 		return buildAndSend(req.Conn, req.SrcAddr, msg...)
 	}
 
+	// The same five-tuple is already being admitted by another request. Only one
+	// admission may reserve a relay address, so reject this one with 437; the
+	// client retries and either finds the published allocation or starts a fresh
+	// admission generation.
+	if req.AllocationManager.AdmissionInProgress(fiveTuple) {
+		msg := buildMsg(
+			stunMsg.TransactionID,
+			stun.NewType(stun.MethodAllocate, stun.ClassErrorResponse),
+			&stun.ErrorCodeAttribute{Code: stun.CodeAllocMismatch}, messageIntegrity)
+
+		return buildAndSendErr(req.Conn, req.SrcAddr, allocation.ErrAdmissionInProgress, msg...)
+	}
+
 	// 3. The server checks if the request contains a REQUESTED-TRANSPORT
 	//    attribute.  If the REQUESTED-TRANSPORT attribute is not included
 	//    or is malformed, the server rejects the request with a 400 (Bad
@@ -116,18 +130,24 @@ func handleAllocateRequest(req Request, stunMsg *stun.Message) error { //nolint:
 	//     corresponding relayed transport address is still available).  If
 	//     the token is not valid for some reason, the server rejects the
 	//     request with a 508 (Insufficient Capacity) error.
+	//
+	//     The token is consumed only after admission succeeds, below, so a
+	//     request that never reaches admission cannot burn it.
 	var reservationTokenAttr proto.ReservationToken
+	hasReservationToken := false
 	if err = reservationTokenAttr.GetFrom(stunMsg); err == nil {
 		var evenPort proto.EvenPort
 		if err = evenPort.GetFrom(stunMsg); err == nil {
 			return buildAndSendErr(req.Conn, req.SrcAddr, errRequestWithReservationTokenAndEvenPort, badRequestMsg...)
 		}
 
-		allocationPort, reservationFound := req.AllocationManager.GetReservation(string(reservationTokenAttr))
-		if !reservationFound {
+		// Validate the token before the quota check, so a stale token is
+		// rejected without consuming a quota slot. It is consumed atomically
+		// after admission, since two clients may race for the same token.
+		if _, reservationFound := req.AllocationManager.GetReservation(string(reservationTokenAttr)); !reservationFound {
 			return buildAndSendErr(req.Conn, req.SrcAddr, errNoAllocationFound, insufficientCapacityMsg...)
 		}
-		requestedPort = allocationPort + 1
+		hasReservationToken = true
 	}
 
 	// 6. The server checks if the request contains an EVEN-PORT attribute.
@@ -136,19 +156,11 @@ func handleAllocateRequest(req Request, stunMsg *stun.Message) error { //nolint:
 	//    below).  If the server cannot satisfy the request, then the
 	//    server rejects the request with a 508 (Insufficient Capacity)
 	//    error.
+	//
+	//    The even-port probe runs after the quota check so a rejected user never
+	//    makes the address generator open a socket.
 	var evenPort proto.EvenPort
-	if err = evenPort.GetFrom(stunMsg); err == nil {
-		var randomPort int
-		randomPort, err = req.AllocationManager.GetRandomEvenPort()
-		if err != nil {
-			return buildAndSendErr(req.Conn, req.SrcAddr, err, insufficientCapacityMsg...)
-		}
-		requestedPort = randomPort
-		reservationToken, err = randutil.GenerateCryptoRandomString(8, runesAlpha)
-		if err != nil {
-			return err
-		}
-	}
+	hasEvenPort := evenPort.GetFrom(stunMsg) == nil
 
 	// Parse realm (already checked in authenticateRequest)
 	realmAttr := &stun.Realm{}
@@ -202,12 +214,91 @@ func handleAllocateRequest(req Request, stunMsg *stun.Message) error { //nolint:
 	//    server is free to define this allocation quota any way it wishes,
 	//    but SHOULD define it based on the username used to authenticate
 	//    the request, and not on the client's transport address.
+	//
+	//    The quota check happens before any relay port is reserved. A handler
+	//    that reserves a slot when this check passes releases it from
+	//    OnAllocationFailed or OnAllocationDeleted; exactly one of those fires
+	//    for every admitted request.
 	if req.QuotaHandler != nil && !req.QuotaHandler(userID, realmAttr.String(), req.SrcAddr) {
+		quotaErr := &allocation.QuotaExceededError{
+			UserID:     userID,
+			Realm:      realmAttr.String(),
+			RetryAfter: allocation.DefaultQuotaRetryAfter,
+		}
+		req.Log.Warnf("Rejecting Allocate from %s: %v", req.SrcAddr, quotaErr)
+
 		quotaReachedMsg := buildMsg(stunMsg.TransactionID,
 			stun.NewType(stun.MethodAllocate, stun.ClassErrorResponse),
-			&stun.ErrorCodeAttribute{Code: stun.CodeAllocQuotaReached}, messageIntegrity)
+			&stun.ErrorCodeAttribute{
+				Code:   stun.CodeAllocQuotaReached,
+				Reason: quotaReason(quotaErr),
+			},
+			messageIntegrity)
 
 		return buildAndSend(req.Conn, req.SrcAddr, quotaReachedMsg...)
+	}
+
+	// All authentication, permission and quota checks have passed. From here on
+	// a failure must not leak a relay port or a quota slot: the admission owns
+	// them until the allocation is published, and Abort releases them exactly
+	// once.
+	admission, err := req.AllocationManager.BeginAdmission(fiveTuple)
+	if err != nil {
+		if errors.Is(err, allocation.ErrAdmissionInProgress) || errors.Is(err, allocation.ErrAllocationExists) {
+			msg := buildMsg(
+				stunMsg.TransactionID,
+				stun.NewType(stun.MethodAllocate, stun.ClassErrorResponse),
+				&stun.ErrorCodeAttribute{Code: stun.CodeAllocMismatch}, messageIntegrity)
+
+			notifyAllocationFailed(req, fiveTuple, userID, realmAttr.String(), err)
+
+			return buildAndSendErr(req.Conn, req.SrcAddr, err, msg...)
+		}
+		notifyAllocationFailed(req, fiveTuple, userID, realmAttr.String(), err)
+
+		return buildAndSendErr(req.Conn, req.SrcAddr, err, insufficientCapacityMsg...)
+	}
+
+	// The admission is aborted on every path that does not publish an
+	// allocation. Once CreateAllocationWithAdmission succeeds the allocation
+	// itself owns the relay port and quota slot, and OnAllocationDeleted will
+	// release the slot.
+	consumedReservationPort := 0
+	consumedReservation := false
+	defer func() {
+		admission.Abort()
+	}()
+
+	if hasReservationToken {
+		allocationPort, reservationFound := req.AllocationManager.TakeReservation(string(reservationTokenAttr))
+		if !reservationFound {
+			notifyAllocationFailed(req, fiveTuple, userID, realmAttr.String(), errNoAllocationFound)
+
+			return buildAndSendErr(req.Conn, req.SrcAddr, errNoAllocationFound, insufficientCapacityMsg...)
+		}
+		requestedPort = allocationPort + 1
+		consumedReservationPort = allocationPort
+		consumedReservation = true
+	}
+
+	if hasEvenPort {
+		var randomPort int
+		randomPort, err = req.AllocationManager.GetRandomEvenPort()
+		if err != nil {
+			restoreConsumedReservation(req, consumedReservation, consumedReservationPort, reservationTokenAttr)
+			notifyAllocationFailed(req, fiveTuple, userID, realmAttr.String(), err)
+
+			return buildAndSendErr(req.Conn, req.SrcAddr, err, insufficientCapacityMsg...)
+		}
+		requestedPort = randomPort
+
+		reservationToken, err = randutil.GenerateCryptoRandomString(8, runesAlpha)
+		if err != nil {
+			restoreConsumedReservation(req, consumedReservation, consumedReservationPort, reservationTokenAttr)
+			notifyAllocationFailed(req, fiveTuple, userID, realmAttr.String(), err)
+
+			return err
+		}
 	}
 
 	// 8. Also at any point, the server MAY choose to reject the request
@@ -215,8 +306,8 @@ func handleAllocateRequest(req Request, stunMsg *stun.Message) error { //nolint:
 	//    client to a different server.  The use of this error code and
 	//    attribute follow the specification in [RFC5389].
 	lifetimeDuration := allocationLifeTime(req, stunMsg)
-	alloc, err := req.AllocationManager.CreateAllocation(
-		fiveTuple,
+	alloc, err := req.AllocationManager.CreateAllocationWithAdmission(
+		admission,
 		req.Conn,
 		requestedTransport.Protocol,
 		requestedPort,
@@ -226,6 +317,9 @@ func handleAllocateRequest(req Request, stunMsg *stun.Message) error { //nolint:
 		requestedFamily,
 	)
 	if err != nil {
+		restoreConsumedReservation(req, consumedReservation, consumedReservationPort, reservationTokenAttr)
+		notifyAllocationFailed(req, fiveTuple, userID, realmAttr.String(), err)
+
 		return buildAndSendErr(req.Conn, req.SrcAddr, err, insufficientCapacityMsg...)
 	}
 
@@ -240,14 +334,19 @@ func handleAllocateRequest(req Request, stunMsg *stun.Message) error { //nolint:
 	//     address was reserved).
 	//   * An XOR-MAPPED-ADDRESS attribute containing the client's IP address
 	//     and port (from the 5-tuple).
-
 	srcIP, srcPort, err := ipnet.AddrIPPort(req.SrcAddr)
 	if err != nil {
+		restoreConsumedReservation(req, consumedReservation, consumedReservationPort, reservationTokenAttr)
+		req.AllocationManager.DeleteAllocationIf(alloc)
+
 		return buildAndSendErr(req.Conn, req.SrcAddr, err, badRequestMsg...)
 	}
 
 	relayIP, relayPort, err := ipnet.AddrIPPort(alloc.RelayAddr)
 	if err != nil {
+		restoreConsumedReservation(req, consumedReservation, consumedReservationPort, reservationTokenAttr)
+		req.AllocationManager.DeleteAllocationIf(alloc)
+
 		return buildAndSendErr(req.Conn, req.SrcAddr, err, badRequestMsg...)
 	}
 
@@ -277,7 +376,55 @@ func handleAllocateRequest(req Request, stunMsg *stun.Message) error { //nolint:
 	)
 	alloc.SetResponseCache(stunMsg.TransactionID, responseAttrs)
 
-	return buildAndSend(req.Conn, req.SrcAddr, msg...)
+	if err = buildAndSend(req.Conn, req.SrcAddr, msg...); err != nil {
+		// The client never saw the relay address, so the allocation and its
+		// quota slot must not survive the failed response. OnAllocationDeleted
+		// released the slot; do not also report OnAllocationFailed.
+		req.AllocationManager.DeleteAllocationIf(alloc)
+		if reservationToken != "" {
+			req.AllocationManager.RemoveReservation(reservationToken)
+		}
+		restoreConsumedReservation(req, consumedReservation, consumedReservationPort, reservationTokenAttr)
+
+		return err
+	}
+
+	return nil
+}
+
+// restoreConsumedReservation returns a RESERVATION-TOKEN taken for an Allocate
+// request that failed before producing an allocation, so the client can retry
+// with the same token.
+func restoreConsumedReservation(req Request, consumed bool, consumedPort int, token proto.ReservationToken) {
+	if !consumed {
+		return
+	}
+
+	req.AllocationManager.RestoreReservation(string(token), consumedPort)
+}
+
+// quotaReason renders a 486 reason phrase that names the cause and the retry
+// window, capped to the 763 byte ERROR-CODE reason limit.
+func quotaReason(err *allocation.QuotaExceededError) []byte {
+	retryAfter := int64(err.RetryAfter / time.Second)
+	reason := fmt.Sprintf("Allocation Quota Reached; retry after %ds", retryAfter)
+	if len(reason) > 763 {
+		reason = reason[:763]
+	}
+
+	return []byte(reason)
+}
+
+// notifyAllocationFailed reports an Allocate request that passed the quota check
+// but did not produce an allocation, so a slot reserved by QuotaHandler can be
+// released exactly once.
+func notifyAllocationFailed(req Request, fiveTuple *allocation.FiveTuple, userID, realm string, cause error) {
+	handler := req.AllocationManager.EventHandler.OnAllocationFailed
+	if handler == nil {
+		return
+	}
+
+	handler(fiveTuple.SrcAddr, fiveTuple.DstAddr, fiveTuple.Protocol.String(), userID, realm, cause)
 }
 
 func handleRefreshRequest(req Request, stunMsg *stun.Message) error {
@@ -308,37 +455,18 @@ func handleRefreshRequest(req Request, stunMsg *stun.Message) error {
 	// FAMILY attribute, and the attribute's value doesn't match the address
 	// family of the allocation, the server MUST reply with a 443 (Peer
 	// Address Family Mismatch) Refresh error response."
-	var requestedFamily proto.RequestedAddressFamily
-	badRequestMsg := buildMsg(
-		stunMsg.TransactionID,
-		stun.NewType(stun.MethodRefresh, stun.ClassErrorResponse),
-		&stun.ErrorCodeAttribute{Code: stun.CodeBadRequest}, messageIntegrity)
-	if err = requestedFamily.GetFrom(stunMsg); err != nil {
-		switch {
-		case errors.Is(err, stun.ErrAttributeNotFound):
-		case stun.IsAttrSizeInvalid(err) || stun.IsAttrSizeOverflow(err):
-			return buildAndSendErr(req.Conn, req.SrcAddr, err, badRequestMsg...)
-		default:
-			msg := buildMsg(
-				stunMsg.TransactionID,
-				stun.NewType(stun.MethodRefresh, stun.ClassErrorResponse),
-				&stun.ErrorCodeAttribute{Code: stun.CodePeerAddrFamilyMismatch}, messageIntegrity)
-
-			return buildAndSendErr(req.Conn, req.SrcAddr, errPeerAddressFamilyMismatch, msg...)
-		}
-	} else if requestedFamily != a.AddressFamily() {
-		msg := buildMsg(
-			stunMsg.TransactionID,
-			stun.NewType(stun.MethodRefresh, stun.ClassErrorResponse),
-			&stun.ErrorCodeAttribute{Code: stun.CodePeerAddrFamilyMismatch}, messageIntegrity)
-
-		return buildAndSendErr(req.Conn, req.SrcAddr, errPeerAddressFamilyMismatch, msg...)
+	if err = checkRefreshAddressFamily(req, stunMsg, a, messageIntegrity); err != nil {
+		return err
 	}
 
 	if lifetimeDuration != 0 {
-		a.Refresh(lifetimeDuration)
+		// A Refresh for a generation that has already been reclaimed must not
+		// bring it back; Refresh reports that instead of resetting a dead timer.
+		if !a.Refresh(lifetimeDuration) {
+			return fmt.Errorf("%w %v:%v", errNoAllocationFound, req.SrcAddr, req.Conn.LocalAddr())
+		}
 	} else {
-		req.AllocationManager.DeleteAllocation(fiveTuple)
+		req.AllocationManager.DeleteAllocationIf(a)
 	}
 
 	return buildAndSend(
@@ -355,6 +483,48 @@ func handleRefreshRequest(req Request, stunMsg *stun.Message) error {
 			}...,
 		)...,
 	)
+}
+
+// checkRefreshAddressFamily enforces the RFC 6156 address-family rules for a
+// Refresh request.
+func checkRefreshAddressFamily(
+	req Request,
+	stunMsg *stun.Message,
+	alloc *allocation.Allocation,
+	messageIntegrity stun.MessageIntegrity,
+) error {
+	var requestedFamily proto.RequestedAddressFamily
+	badRequestMsg := buildMsg(
+		stunMsg.TransactionID,
+		stun.NewType(stun.MethodRefresh, stun.ClassErrorResponse),
+		&stun.ErrorCodeAttribute{Code: stun.CodeBadRequest}, messageIntegrity)
+
+	if err := requestedFamily.GetFrom(stunMsg); err != nil {
+		switch {
+		case errors.Is(err, stun.ErrAttributeNotFound):
+			return nil
+		case stun.IsAttrSizeInvalid(err) || stun.IsAttrSizeOverflow(err):
+			return buildAndSendErr(req.Conn, req.SrcAddr, err, badRequestMsg...)
+		default:
+			msg := buildMsg(
+				stunMsg.TransactionID,
+				stun.NewType(stun.MethodRefresh, stun.ClassErrorResponse),
+				&stun.ErrorCodeAttribute{Code: stun.CodePeerAddrFamilyMismatch}, messageIntegrity)
+
+			return buildAndSendErr(req.Conn, req.SrcAddr, errPeerAddressFamilyMismatch, msg...)
+		}
+	}
+
+	if requestedFamily != alloc.AddressFamily() {
+		msg := buildMsg(
+			stunMsg.TransactionID,
+			stun.NewType(stun.MethodRefresh, stun.ClassErrorResponse),
+			&stun.ErrorCodeAttribute{Code: stun.CodePeerAddrFamilyMismatch}, messageIntegrity)
+
+		return buildAndSendErr(req.Conn, req.SrcAddr, errPeerAddressFamilyMismatch, msg...)
+	}
+
+	return nil
 }
 
 func handleCreatePermissionRequest(req Request, stunMsg *stun.Message) error {

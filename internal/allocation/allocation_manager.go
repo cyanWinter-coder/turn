@@ -38,6 +38,10 @@ type AllocateListenerConfig struct {
 	// A value of 0 indicates that the client did not request a specific port and any
 	// available port may be used.
 	RequestedPort int
+	// Generation identifies the admission attempt that triggered this call. It is
+	// incremented for every attempt, so a generator that keeps state can tell a
+	// retry from the original request.
+	Generation uint64
 }
 
 // AllocateConnConfig contains the parameters passed to the relay address allocator
@@ -76,6 +80,41 @@ type ManagerConfig struct {
 type reservation struct {
 	token string
 	port  int
+	timer *time.Timer
+}
+
+// Admission is the right to create the single allocation for a five-tuple. It
+// is obtained from Manager.BeginAdmission after authentication has passed and
+// before any relay port or quota slot is consumed. While it is held, other
+// Allocate requests for the same five-tuple are rejected with
+// ErrAdmissionInProgress, so only one relay address is ever reserved for it.
+//
+// An Admission must be finished by CreateAllocationWithAdmission. If that is
+// not possible, Abort releases it so a later retry can use a fresh generation.
+// Abort is idempotent.
+type Admission struct {
+	manager     *Manager
+	fiveTuple   *FiveTuple
+	fingerprint FiveTupleFingerprint
+	generation  uint64
+	committed   bool // guarded by manager lock
+	aborted     bool // guarded by manager lock
+}
+
+// Generation identifies this admission attempt. It increases monotonically for
+// every admission the manager grants, including retries after a failed attempt.
+func (a *Admission) Generation() uint64 {
+	return a.generation
+}
+
+// Abort releases the admission if it has not been committed. It is safe to call
+// multiple times and after a successful commit (where it is a no-op).
+func (a *Admission) Abort() {
+	if a == nil || a.manager == nil {
+		return
+	}
+
+	a.manager.abortAdmission(a)
 }
 
 // Manager is used to hold active allocations.
@@ -85,7 +124,10 @@ type Manager struct {
 	tcpConnectionBindTimeout time.Duration
 
 	allocations  map[FiveTupleFingerprint]*Allocation
+	admitting    map[FiveTupleFingerprint]*Admission
 	reservations []*reservation
+	generation   uint64
+	closed       bool
 
 	allocatePacketConn func(conf AllocateListenerConfig) (net.PacketConn, net.Addr, error)
 	allocateListener   func(conf AllocateListenerConfig) (net.Listener, net.Addr, error)
@@ -115,6 +157,7 @@ func NewManager(config ManagerConfig) (*Manager, error) {
 	return &Manager{
 		log:                      config.LeveledLogger,
 		allocations:              make(map[FiveTupleFingerprint]*Allocation, 64),
+		admitting:                make(map[FiveTupleFingerprint]*Admission),
 		allocatePacketConn:       config.AllocatePacketConn,
 		allocateListener:         config.AllocateListener,
 		allocateConn:             config.AllocateConn,
@@ -122,6 +165,90 @@ func NewManager(config ManagerConfig) (*Manager, error) {
 		EventHandler:             config.EventHandler,
 		tcpConnectionBindTimeout: tcpConnectionBindTimeout,
 	}, nil
+}
+
+// BeginAdmission reserves the right to create the allocation for fiveTuple.
+//
+// It must be called after authentication has passed and before the relay
+// address is obtained from the generator, so a request that is going to be
+// rejected never consumes a relay port or a quota slot. While the admission is
+// held, concurrent Allocate requests for the same five-tuple fail with
+// ErrAdmissionInProgress instead of each reserving their own relay address. A
+// failed attempt must call Abort so that a retry gets a new generation.
+func (m *Manager) BeginAdmission(fiveTuple *FiveTuple) (*Admission, error) {
+	switch {
+	case fiveTuple == nil:
+		return nil, errNilFiveTuple
+	case fiveTuple.SrcAddr == nil:
+		return nil, errNilFiveTupleSrcAddr
+	case fiveTuple.DstAddr == nil:
+		return nil, errNilFiveTupleDstAddr
+	}
+
+	fingerprint := fiveTuple.Fingerprint()
+
+	m.lock.Lock()
+	defer m.lock.Unlock()
+
+	switch {
+	case m.closed:
+		return nil, errManagerClosed
+	case m.allocations[fingerprint] != nil:
+		return nil, fmt.Errorf("%w: %v", ErrAllocationExists, fiveTuple)
+	}
+
+	if _, inProgress := m.admitting[fingerprint]; inProgress {
+		return nil, fmt.Errorf("%w: %v", ErrAdmissionInProgress, fiveTuple)
+	}
+
+	m.generation++
+	admission := &Admission{
+		manager:     m,
+		fiveTuple:   fiveTuple,
+		fingerprint: fingerprint,
+		generation:  m.generation,
+	}
+	m.admitting[fingerprint] = admission
+
+	return admission, nil
+}
+
+func (m *Manager) abortAdmission(admission *Admission) {
+	m.lock.Lock()
+	defer m.lock.Unlock()
+
+	if admission.committed || admission.aborted {
+		return
+	}
+	admission.aborted = true
+
+	if current, ok := m.admitting[admission.fingerprint]; ok && current == admission {
+		delete(m.admitting, admission.fingerprint)
+	}
+}
+
+// AdmissionInProgress reports whether an Allocate request for fiveTuple is
+// currently being admitted.
+func (m *Manager) AdmissionInProgress(fiveTuple *FiveTuple) bool {
+	if fiveTuple == nil {
+		return false
+	}
+
+	m.lock.RLock()
+	defer m.lock.RUnlock()
+
+	_, inProgress := m.admitting[fiveTuple.Fingerprint()]
+
+	return inProgress
+}
+
+// AdmissionCount returns the number of Allocate requests currently being
+// admitted.
+func (m *Manager) AdmissionCount() int {
+	m.lock.RLock()
+	defer m.lock.RUnlock()
+
+	return len(m.admitting)
 }
 
 // GetAllocation fetches the allocation matching the passed FiveTuple.
@@ -155,16 +282,34 @@ func (m *Manager) Close() error {
 	m.lock.Lock()
 	defer m.lock.Unlock()
 
+	m.closed = true
+	// Abort every in-flight admission so their failure paths cannot leave
+	// reservations behind and retries fail fast against a closed manager.
+	for _, admission := range m.admitting {
+		admission.aborted = true
+	}
+	clear(m.admitting)
+
+	for _, r := range m.reservations {
+		if r.timer != nil {
+			r.timer.Stop()
+		}
+	}
+	clear(m.reservations)
+
 	for _, a := range m.allocations {
 		if err := a.Close(); err != nil {
 			return err
 		}
 	}
+	clear(m.allocations)
 
 	return nil
 }
 
-// CreateAllocation creates a new allocation and starts relaying.
+// CreateAllocation creates a new allocation and starts relaying. It is
+// equivalent to BeginAdmission followed by CreateAllocationWithAdmission, and is
+// kept for callers that have no checks to run between the two steps.
 func (m *Manager) CreateAllocation( // nolint: cyclop
 	fiveTuple *FiveTuple,
 	turnSocket net.PacketConn,
@@ -174,26 +319,66 @@ func (m *Manager) CreateAllocation( // nolint: cyclop
 	userID, realm string,
 	addressFamily proto.RequestedAddressFamily,
 ) (*Allocation, error) {
+	admission, err := m.BeginAdmission(fiveTuple)
+	if err != nil {
+		return nil, err
+	}
+
+	return m.CreateAllocationWithAdmission(
+		admission, turnSocket, protocol, requestedPort, lifetime, userID, realm, addressFamily,
+	)
+}
+
+// CreateAllocationWithAdmission reserves the relay address and publishes the
+// allocation for an admission obtained from BeginAdmission.
+//
+// Nothing is retained unless the whole transaction succeeds: a generator
+// failure, a concurrent publication or a closed manager aborts the admission and
+// closes any relay socket that was already created, so no relay port or quota
+// slot is leaked. Any failure also frees the five-tuple for a retry with a fresh
+// generation.
+func (m *Manager) CreateAllocationWithAdmission( // nolint: cyclop
+	admission *Admission,
+	turnSocket net.PacketConn,
+	protocol proto.Protocol,
+	requestedPort int,
+	lifetime time.Duration,
+	userID, realm string,
+	addressFamily proto.RequestedAddressFamily,
+) (*Allocation, error) {
+	if admission == nil || admission.manager != m {
+		return nil, errAdmissionRequired
+	}
+	fiveTuple := admission.fiveTuple
+
 	switch {
-	case fiveTuple == nil:
-		return nil, errNilFiveTuple
-	case fiveTuple.SrcAddr == nil:
-		return nil, errNilFiveTupleSrcAddr
-	case fiveTuple.DstAddr == nil:
-		return nil, errNilFiveTupleDstAddr
 	case turnSocket == nil:
+		admission.Abort()
+
 		return nil, errNilTurnSocket
 	case lifetime == 0:
+		admission.Abort()
+
 		return nil, errLifetimeZero
 	}
 
-	if alloc := m.GetAllocation(fiveTuple); alloc != nil {
-		return nil, fmt.Errorf("%w: %v", errDupeFiveTuple, fiveTuple)
+	switch protocol {
+	case proto.ProtoUDP, proto.ProtoTCP:
+	default:
+		admission.Abort()
+
+		return nil, errUnsupportedTransport
 	}
+
+	// Abort is a no-op after a successful commit, so every failure path below
+	// unlocks the five-tuple exactly once.
+	defer admission.Abort()
+
 	alloc := NewAllocation(turnSocket, fiveTuple, m.EventHandler, m.log)
 	alloc.userID = userID
 	alloc.realm = realm
 	alloc.addressFamily = addressFamily
+	alloc.generation = admission.generation
 
 	switch protocol {
 	case proto.ProtoUDP:
@@ -206,6 +391,7 @@ func (m *Manager) CreateAllocation( // nolint: cyclop
 			UserID:        userID,
 			Realm:         realm,
 			RequestedPort: requestedPort,
+			Generation:    admission.generation,
 		})
 		if err != nil {
 			return nil, err
@@ -222,6 +408,7 @@ func (m *Manager) CreateAllocation( // nolint: cyclop
 			UserID:        userID,
 			Realm:         realm,
 			RequestedPort: requestedPort,
+			Generation:    admission.generation,
 		})
 		if err != nil {
 			return nil, err
@@ -232,12 +419,31 @@ func (m *Manager) CreateAllocation( // nolint: cyclop
 
 	m.log.Debugf("Listening on relay address: %s", alloc.RelayAddr)
 
-	alloc.lifetimeTimer = time.AfterFunc(lifetime, func() {
-		m.DeleteAllocation(alloc.fiveTuple)
-	})
-
+	// Publish and commit under the same lock that guards admission lookups, so a
+	// concurrent Allocate either sees the allocation or sees the admission still
+	// in progress, never a half-published allocation.
 	m.lock.Lock()
-	m.allocations[fiveTuple.Fingerprint()] = alloc
+	if m.closed {
+		m.lock.Unlock()
+		closeUnpublishedAllocation(alloc, m.log)
+		m.log.Debugf("Manager closed while admitting allocation for %v", fiveTuple)
+
+		return nil, errManagerClosed
+	}
+	if existing := m.allocations[admission.fingerprint]; existing != nil {
+		m.lock.Unlock()
+		closeUnpublishedAllocation(alloc, m.log)
+		m.log.Debugf("Allocation for %v was published concurrently, discarding duplicate", fiveTuple)
+
+		return nil, fmt.Errorf("%w: %v", ErrAllocationExists, fiveTuple)
+	}
+
+	alloc.lifetimeTimer = time.AfterFunc(lifetime, func() {
+		m.DeleteAllocationIf(alloc)
+	})
+	m.allocations[admission.fingerprint] = alloc
+	admission.committed = true
+	delete(m.admitting, admission.fingerprint)
 	m.lock.Unlock()
 
 	if m.EventHandler.OnAllocationCreated != nil {
@@ -257,51 +463,166 @@ func (m *Manager) CreateAllocation( // nolint: cyclop
 	return alloc, nil
 }
 
+// closeUnpublishedAllocation closes the relay sockets of an allocation that was
+// never published. It must not touch the manager, so it is safe on every early
+// return path.
+func closeUnpublishedAllocation(alloc *Allocation, log logging.LeveledLogger) {
+	if err := alloc.Close(); err != nil {
+		log.Errorf("Failed to close unpublished allocation %v: %v", alloc.fiveTuple, err)
+	}
+}
+
 // DeleteAllocation removes an allocation.
 func (m *Manager) DeleteAllocation(fiveTuple *FiveTuple) {
-	fingerprint := fiveTuple.Fingerprint()
+	if fiveTuple == nil {
+		return
+	}
 
-	m.lock.Lock()
-	allocation := m.allocations[fingerprint]
-	delete(m.allocations, fingerprint)
-	m.lock.Unlock()
+	m.removeAllocation(fiveTuple.Fingerprint(), nil)
+}
 
+// DeleteAllocationIf removes the allocation only if it is still the one the
+// caller observed. Lifetime timers and relay loops use it so a stale generation
+// can never tear down the allocation that replaced it.
+func (m *Manager) DeleteAllocationIf(allocation *Allocation) {
 	if allocation == nil {
 		return
 	}
 
+	m.removeAllocation(allocation.fiveTuple.Fingerprint(), allocation)
+}
+
+// DeleteAllocationForConn is like DeleteAllocationForSocket for a stream control
+// connection; the allocation's TURN socket may be a wrapper (such as
+// proto.STUNConn) around the connection that carried the request.
+func (m *Manager) DeleteAllocationForConn(fiveTuple *FiveTuple, turnConn net.Conn) {
+	if fiveTuple == nil || turnConn == nil {
+		return
+	}
+
+	m.deleteAllocationServedBy(fiveTuple.Fingerprint(), func(a *Allocation) bool {
+		return turnSocketWraps(a.TurnSocket, turnConn)
+	})
+}
+
+// turnSocketWraps reports whether turnSocket is turnConn or a packet conn that
+// wraps it. TURN over TCP/TLS allocates against a *proto.STUNConn, so a plain
+// identity check would miss the connection that owns the allocation.
+func turnSocketWraps(turnSocket net.PacketConn, turnConn net.Conn) bool {
+	if turnSocket == nil {
+		return false
+	}
+
+	if conn, ok := turnSocket.(net.Conn); ok && conn == turnConn {
+		return true
+	}
+
+	if unwrapper, ok := turnSocket.(interface{ Conn() net.Conn }); ok {
+		return unwrapper.Conn() == turnConn
+	}
+
+	return false
+}
+
+func (m *Manager) deleteAllocationServedBy(fingerprint FiveTupleFingerprint, serves func(*Allocation) bool) {
+	m.lock.RLock()
+	current := m.allocations[fingerprint]
+	m.lock.RUnlock()
+
+	if current == nil || !serves(current) {
+		return
+	}
+
+	m.removeAllocation(fingerprint, current)
+}
+
+// removeAllocation detaches and closes the allocation for fingerprint. When
+// expected is non-nil the allocation is only removed if it is still the same
+// object. The manager lock is held across the identity check and the close so a
+// lifetime timer or relay-loop error from an older generation cannot remove its
+// replacement, and a fresh admission cannot interleave with teardown. All
+// reclaim paths therefore observe the same order: detach, stop timers and
+// permissions, close the relay socket, call OnAllocationDeleted exactly once.
+func (m *Manager) removeAllocation(fingerprint FiveTupleFingerprint, expected *Allocation) {
 	m.lock.Lock()
+
+	allocation := m.allocations[fingerprint]
+	if allocation == nil || (expected != nil && allocation != expected) {
+		m.lock.Unlock()
+
+		return
+	}
+	delete(m.allocations, fingerprint)
+
 	if err := allocation.Close(); err != nil {
 		m.log.Errorf("Failed to close allocation: %v", err)
 	}
 	m.lock.Unlock()
 
 	if m.EventHandler.OnAllocationDeleted != nil {
-		m.EventHandler.OnAllocationDeleted(fiveTuple.SrcAddr, fiveTuple.DstAddr,
-			fiveTuple.Protocol.String(), allocation.userID, allocation.realm)
+		m.EventHandler.OnAllocationDeleted(allocation.fiveTuple.SrcAddr, allocation.fiveTuple.DstAddr,
+			allocation.fiveTuple.Protocol.String(), allocation.userID, allocation.realm)
 	}
 }
 
 // CreateReservation stores the reservation for the token+port.
 func (m *Manager) CreateReservation(reservationToken string, port int) {
-	time.AfterFunc(30*time.Second, func() {
-		m.lock.Lock()
-		defer m.lock.Unlock()
-		for i := len(m.reservations) - 1; i >= 0; i-- {
-			if m.reservations[i].token == reservationToken {
-				m.reservations = append(m.reservations[:i], m.reservations[i+1:]...)
-
-				return
-			}
-		}
-	})
-
 	m.lock.Lock()
-	m.reservations = append(m.reservations, &reservation{
+	defer m.lock.Unlock()
+
+	if m.closed {
+		return
+	}
+
+	m.reservations = append(m.reservations, m.newReservationLocked(reservationToken, port))
+}
+
+// RestoreReservation puts back a reservation that was taken by TakeReservation
+// but could not be used, with a fresh expiry window. The reserved port itself is
+// not bound by the reservation, so the reservation can still be honored by a
+// retry.
+func (m *Manager) RestoreReservation(reservationToken string, port int) {
+	m.lock.Lock()
+	defer m.lock.Unlock()
+
+	if m.closed {
+		return
+	}
+
+	for _, r := range m.reservations {
+		if r.token == reservationToken {
+			return
+		}
+	}
+
+	m.reservations = append(m.reservations, m.newReservationLocked(reservationToken, port))
+}
+
+// newReservationLocked builds a reservation with its expiry timer. The manager
+// lock must be held.
+func (m *Manager) newReservationLocked(reservationToken string, port int) *reservation {
+	r := &reservation{
 		token: reservationToken,
 		port:  port,
+	}
+	r.timer = time.AfterFunc(30*time.Second, func() {
+		m.expireReservation(r)
 	})
-	m.lock.Unlock()
+
+	return r
+}
+
+func (m *Manager) expireReservation(target *reservation) {
+	m.lock.Lock()
+	defer m.lock.Unlock()
+
+	for i, r := range m.reservations {
+		if r == target {
+			m.reservations = append(m.reservations[:i], m.reservations[i+1:]...)
+
+			return
+		}
+	}
 }
 
 // GetReservation returns the port for a given reservation if it exists.
@@ -316,6 +637,49 @@ func (m *Manager) GetReservation(reservationToken string) (int, bool) {
 	}
 
 	return 0, false
+}
+
+// TakeReservation consumes a reservation, returning its port. A reservation can
+// only be used once, so a retried Allocate with the same token does not hand out
+// a relay address that has already been claimed.
+func (m *Manager) TakeReservation(reservationToken string) (int, bool) {
+	m.lock.Lock()
+	defer m.lock.Unlock()
+
+	r := m.takeReservationLocked(func(r *reservation) bool { return r.token == reservationToken })
+	if r == nil {
+		return 0, false
+	}
+
+	return r.port, true
+}
+
+// RemoveReservation drops a reservation that can no longer be honored, for
+// example because the Allocate response that carried it could not be sent.
+func (m *Manager) RemoveReservation(reservationToken string) {
+	m.lock.Lock()
+	defer m.lock.Unlock()
+
+	m.takeReservationLocked(func(r *reservation) bool { return r.token == reservationToken })
+}
+
+// takeReservationLocked removes and returns the first reservation matching
+// match, stopping its expiry timer. The manager lock must be held.
+func (m *Manager) takeReservationLocked(match func(*reservation) bool) *reservation {
+	for i, r := range m.reservations {
+		if !match(r) {
+			continue
+		}
+
+		if r.timer != nil {
+			r.timer.Stop()
+		}
+		m.reservations = append(m.reservations[:i], m.reservations[i+1:]...)
+
+		return r
+	}
+
+	return nil
 }
 
 // GetRandomEvenPort returns a random un-allocated udp4 port.

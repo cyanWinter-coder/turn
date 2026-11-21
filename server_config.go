@@ -130,7 +130,24 @@ type EventHandler = allocation.EventHandler
 // QuotaHandler is a callback allows allocations to be rejected when a per-user quota is
 // exceeded. If the callback returns true the allocation request is accepted, otherwise it is
 // rejected and a 486 (Allocation Quota Reached) error is returned to the user.
+//
+// The check runs before any relay address is reserved, so a rejected request never
+// consumes a relay port. A handler that reserves a slot when it returns true must
+// release it from EventHandler.OnAllocationFailed or
+// EventHandler.OnAllocationDeleted: exactly one of those fires for every accepted
+// request. The 486 response carries a reason phrase naming the retry window,
+// which is at least DefaultQuotaRetryAfter.
 type QuotaHandler func(username, realm string, srcAddr net.Addr) (ok bool)
+
+// QuotaExceededError describes a rejected Allocate request and the minimum time
+// after which the client may retry. The server embeds its retry window in the
+// 486 reason phrase.
+type QuotaExceededError = allocation.QuotaExceededError
+
+// DefaultQuotaRetryAfter is the minimum wait before a client retries an Allocate
+// request rejected with 486 (Allocation Quota Reached). RFC 8656 Section 6.6
+// asks clients to wait at least one minute.
+const DefaultQuotaRetryAfter = allocation.DefaultQuotaRetryAfter
 
 // ServerConfig configures the Pion TURN Server.
 type ServerConfig struct {

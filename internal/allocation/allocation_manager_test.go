@@ -7,11 +7,13 @@ package allocation
 
 import (
 	"context"
+	"errors"
 	"io"
 	"math/rand"
 	"net"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -21,6 +23,8 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
+
+var errTestGeneratorUnavailable = errors.New("relay generator unavailable")
 
 func TestNewManagerValidation(t *testing.T) {
 	loggerFactory := logging.NewDefaultLoggerFactory()
@@ -613,4 +617,270 @@ func TestCreateAllocationIPv6(t *testing.T) {
 	// Delete allocation
 	manager.DeleteAllocation(fiveTuple)
 	assert.Nil(t, manager.GetAllocation(fiveTuple))
+}
+
+// TestAdmissionConcurrentSameFiveTuple verifies that only one of many concurrent
+// admissions for the same five-tuple can reserve a relay address, and that a
+// failed attempt frees the five-tuple for a retry with a new generation.
+func TestAdmissionConcurrentSameFiveTuple(t *testing.T) {
+	turnSocket, err := net.ListenPacket("udp4", "0.0.0.0:0") // nolint: noctx
+	require.NoError(t, err)
+	defer func() {
+		assert.NoError(t, turnSocket.Close())
+	}()
+
+	var allocations atomic.Int32
+	manager, err := NewManager(ManagerConfig{
+		LeveledLogger: logging.NewDefaultLoggerFactory().NewLogger("test"),
+		AllocatePacketConn: func(AllocateListenerConfig) (net.PacketConn, net.Addr, error) {
+			allocations.Add(1)
+			conn, listenErr := net.ListenPacket("udp4", "0.0.0.0:0") // nolint: noctx
+			if listenErr != nil {
+				return nil, nil, listenErr
+			}
+
+			return conn, conn.LocalAddr(), nil
+		},
+		AllocateListener: func(AllocateListenerConfig) (net.Listener, net.Addr, error) { return nil, nil, nil },
+		AllocateConn:     func(AllocateConnConfig) (net.Conn, error) { return nil, nil }, //nolint:nilnil
+	})
+	require.NoError(t, err)
+	defer func() {
+		assert.NoError(t, manager.Close())
+	}()
+
+	fiveTuple := randomFiveTuple()
+
+	admission, err := manager.BeginAdmission(fiveTuple)
+	require.NoError(t, err)
+	require.NotNil(t, admission)
+	require.True(t, manager.AdmissionInProgress(fiveTuple))
+	require.Equal(t, 1, manager.AdmissionCount())
+
+	// A concurrent request for the same five-tuple must not start a second
+	// admission while the first is in flight.
+	_, err = manager.BeginAdmission(fiveTuple)
+	require.ErrorIs(t, err, ErrAdmissionInProgress)
+	assert.Equal(t, 1, manager.AdmissionCount())
+
+	// A failure releases the five-tuple and lets the retry use a new generation.
+	admission.Abort()
+	admission.Abort() // idempotent
+	assert.False(t, manager.AdmissionInProgress(fiveTuple))
+	assert.Equal(t, 0, manager.AdmissionCount())
+
+	retry, err := manager.BeginAdmission(fiveTuple)
+	require.NoError(t, err)
+	assert.Greater(t, retry.Generation(), admission.Generation())
+
+	alloc, err := manager.CreateAllocationWithAdmission(
+		retry, turnSocket, proto.ProtoUDP, 0, proto.DefaultLifetime, "user", "realm", proto.RequestedFamilyIPv4,
+	)
+	require.NoError(t, err)
+	require.NotNil(t, alloc)
+	assert.Equal(t, retry.Generation(), alloc.Generation())
+	assert.Equal(t, int32(1), allocations.Load(), "only one relay address may be reserved")
+	assert.Equal(t, 1, manager.AllocationCount())
+	assert.False(t, manager.AdmissionInProgress(fiveTuple))
+
+	// The committed admission no longer holds the five-tuple but the allocation
+	// does, so another admission is rejected as a duplicate.
+	_, err = manager.BeginAdmission(fiveTuple)
+	require.ErrorIs(t, err, ErrAllocationExists)
+}
+
+// TestAdmissionGeneratorFailureReleasesFiveTuple verifies that a relay generator
+// failure leaves no socket, allocation or admission behind.
+func TestAdmissionGeneratorFailureReleasesFiveTuple(t *testing.T) {
+	turnSocket, err := net.ListenPacket("udp4", "0.0.0.0:0") // nolint: noctx
+	require.NoError(t, err)
+	defer func() {
+		assert.NoError(t, turnSocket.Close())
+	}()
+
+	generatorErr := errTestGeneratorUnavailable
+	var fail atomic.Bool
+	fail.Store(true)
+	manager, err := NewManager(ManagerConfig{
+		LeveledLogger: logging.NewDefaultLoggerFactory().NewLogger("test"),
+		AllocatePacketConn: func(AllocateListenerConfig) (net.PacketConn, net.Addr, error) {
+			if fail.Load() {
+				return nil, nil, generatorErr
+			}
+			conn, listenErr := net.ListenPacket("udp4", "0.0.0.0:0") // nolint: noctx
+			if listenErr != nil {
+				return nil, nil, listenErr
+			}
+
+			return conn, conn.LocalAddr(), nil
+		},
+		AllocateListener: func(AllocateListenerConfig) (net.Listener, net.Addr, error) { return nil, nil, nil },
+		AllocateConn:     func(AllocateConnConfig) (net.Conn, error) { return nil, nil }, //nolint:nilnil
+	})
+	require.NoError(t, err)
+	defer func() {
+		assert.NoError(t, manager.Close())
+	}()
+
+	fiveTuple := randomFiveTuple()
+
+	_, err = manager.CreateAllocation(fiveTuple, turnSocket, proto.ProtoUDP,
+		0, proto.DefaultLifetime, "user", "realm", proto.RequestedFamilyIPv4)
+	require.ErrorIs(t, err, generatorErr)
+	assert.Equal(t, 0, manager.AllocationCount())
+	assert.False(t, manager.AdmissionInProgress(fiveTuple))
+
+	// The retry proceeds with a new generation.
+	fail.Store(false)
+	alloc, err := manager.CreateAllocation(fiveTuple, turnSocket, proto.ProtoUDP,
+		0, proto.DefaultLifetime, "user", "realm", proto.RequestedFamilyIPv4)
+	require.NoError(t, err)
+	require.NotNil(t, alloc)
+	assert.Equal(t, uint64(2), alloc.Generation())
+	assert.Equal(t, 1, manager.AllocationCount())
+}
+
+// TestAdmissionLifetimeZeroReleasesFiveTuple verifies that a request rejected
+// for LIFETIME 0 does not hold the five-tuple.
+func TestAdmissionLifetimeZeroReleasesFiveTuple(t *testing.T) {
+	turnSocket, err := net.ListenPacket("udp4", "0.0.0.0:0") // nolint: noctx
+	require.NoError(t, err)
+	defer func() {
+		assert.NoError(t, turnSocket.Close())
+	}()
+
+	manager, err := newTestManager()
+	require.NoError(t, err)
+	defer func() {
+		assert.NoError(t, manager.Close())
+	}()
+
+	fiveTuple := randomFiveTuple()
+	_, err = manager.CreateAllocation(fiveTuple, turnSocket, proto.ProtoUDP,
+		0, 0, "user", "realm", proto.RequestedFamilyIPv4)
+	require.ErrorIs(t, err, errLifetimeZero)
+	assert.False(t, manager.AdmissionInProgress(fiveTuple))
+	assert.Equal(t, 0, manager.AllocationCount())
+
+	_, err = manager.CreateAllocation(fiveTuple, turnSocket, proto.ProtoUDP,
+		0, proto.DefaultLifetime, "user", "realm", proto.RequestedFamilyIPv4)
+	require.NoError(t, err)
+}
+
+// TestDeleteAllocationIfIgnoresStaleGeneration verifies that a stale lifetime
+// timer or relay loop cannot remove the allocation that replaced it.
+func TestDeleteAllocationIfIgnoresStaleGeneration(t *testing.T) {
+	turnSocket, err := net.ListenPacket("udp4", "0.0.0.0:0") // nolint: noctx
+	require.NoError(t, err)
+	defer func() {
+		assert.NoError(t, turnSocket.Close())
+	}()
+
+	manager, err := newTestManager()
+	require.NoError(t, err)
+	defer func() {
+		assert.NoError(t, manager.Close())
+	}()
+
+	fiveTuple := randomFiveTuple()
+	stale, err := manager.CreateAllocation(fiveTuple, turnSocket, proto.ProtoUDP,
+		0, proto.DefaultLifetime, "user", "realm", proto.RequestedFamilyIPv4)
+	require.NoError(t, err)
+
+	manager.DeleteAllocationIf(stale)
+	require.Nil(t, manager.GetAllocation(fiveTuple))
+
+	current, err := manager.CreateAllocation(fiveTuple, turnSocket, proto.ProtoUDP,
+		0, proto.DefaultLifetime, "user", "realm", proto.RequestedFamilyIPv4)
+	require.NoError(t, err)
+	require.NotNil(t, current)
+
+	// A late teardown for the previous allocation must be a no-op.
+	manager.DeleteAllocationIf(stale)
+	require.Same(t, current, manager.GetAllocation(fiveTuple))
+	require.False(t, current.IsClosed())
+}
+
+// TestAllocationCloseIdempotent verifies that teardown is idempotent and that a
+// closed allocation cannot be revived by late data or refresh.
+func TestAllocationCloseIdempotent(t *testing.T) {
+	conn, err := net.ListenPacket("udp4", "0.0.0.0:0") // nolint: noctx
+	require.NoError(t, err)
+
+	fiveTuple := randomFiveTuple()
+	alloc := NewAllocation(nil, fiveTuple, EventHandler{}, logging.NewDefaultLoggerFactory().NewLogger("test"))
+	alloc.relayPacketConn = conn
+	alloc.lifetimeTimer = time.NewTimer(time.Hour)
+
+	peer := &net.UDPAddr{IP: net.IPv4(192, 0, 2, 1), Port: 3478}
+	alloc.AddPermission(NewPermission(peer, alloc.log, time.Hour))
+	permTimer := alloc.GetPermission(peer).lifetimeTimer
+
+	require.NoError(t, alloc.Close())
+	require.NoError(t, alloc.Close())
+	require.True(t, alloc.IsClosed())
+	require.False(t, alloc.Refresh(time.Hour), "refresh must not revive a closed allocation")
+	alloc.AddPermission(NewPermission(peer, alloc.log, time.Hour))
+	require.Nil(t, alloc.GetPermission(peer), "permission must not be revived after close")
+	require.ErrorIs(t, alloc.AddChannelBind(NewChannelBind(proto.MinChannelNumber, peer, alloc.log),
+		proto.DefaultLifetime, time.Hour), errAllocationClosed)
+	require.Nil(t, alloc.GetChannelByNumber(proto.MinChannelNumber))
+	_, err = alloc.WriteTo([]byte("late"), peer)
+	require.ErrorIs(t, err, errAllocationClosed)
+	require.False(t, permTimer.Stop(), "permission timer must already be stopped")
+}
+
+// TestPermissionRemovalReportsOnce verifies that a permission timer firing while
+// the allocation is torn down reports the deletion only once.
+func TestPermissionRemovalReportsOnce(t *testing.T) {
+	var deletions atomic.Int32
+	alloc := NewAllocation(nil, &FiveTuple{}, EventHandler{
+		OnPermissionDeleted: func(_, _ net.Addr, _, _, _ string, _ net.Addr, _ net.IP) {
+			deletions.Add(1)
+		},
+	}, logging.NewDefaultLoggerFactory().NewLogger("test"))
+
+	peer := &net.UDPAddr{IP: net.IPv4(192, 0, 2, 1), Port: 3478}
+	alloc.AddPermission(NewPermission(peer, alloc.log, time.Hour))
+
+	require.NoError(t, alloc.Close())
+	alloc.RemovePermission(peer)
+
+	require.Equal(t, int32(1), deletions.Load())
+}
+
+// TestReservationLifecycle verifies that a reservation can only be taken once and
+// that a failed attempt can put it back for a retry.
+func TestReservationLifecycle(t *testing.T) {
+	manager, err := newTestManager()
+	require.NoError(t, err)
+	defer func() {
+		assert.NoError(t, manager.Close())
+	}()
+
+	manager.CreateReservation("token", 5000)
+
+	port, ok := manager.GetReservation("token")
+	require.True(t, ok)
+	require.Equal(t, 5000, port)
+
+	port, ok = manager.TakeReservation("token")
+	require.True(t, ok)
+	require.Equal(t, 5000, port)
+
+	// A consumed token must not be handed out a second time.
+	_, ok = manager.TakeReservation("token")
+	require.False(t, ok)
+	_, ok = manager.GetReservation("token")
+	require.False(t, ok)
+
+	// A failed request can restore the token for a retry.
+	manager.RestoreReservation("token", port)
+	port, ok = manager.GetReservation("token")
+	require.True(t, ok)
+	require.Equal(t, 5000, port)
+
+	manager.RemoveReservation("token")
+	_, ok = manager.GetReservation("token")
+	require.False(t, ok)
 }
